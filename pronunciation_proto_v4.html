@@ -3,7 +3,8 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>🎤 발음 연습 - English Speaking Coach v0.4</title>
+<title>🎤 발음 연습 - English Speaking Coach v0.5</title>
+<script src="https://aka.ms/csspeech/jsbrowserpackageraw"></script>
 <style>
   @import url('https://fonts.googleapis.com/css2?family=Nunito:wght@400;700;900&family=Noto+Sans+KR:wght@400;700&display=swap');
 
@@ -445,7 +446,7 @@
 
 <header>
   <h1>🎤 English Speaking Coach</h1>
-  <p>발음을 듣고 피드백을 드릴게요! — Prototype v0.4</p>
+  <p>발음을 듣고 피드백을 드릴게요! — Prototype v0.5</p>
 </header>
 
 <!-- API 설정 (개발용) -->
@@ -567,9 +568,8 @@ const SENTENCES = [
 ];
 
 let currentIdx = 0;
-let mediaRecorder = null;
-let audioChunks = [];
 let isRecording = false;
+let currentRecognizer = null;
 
 // ── 초기화 ───────────────────────────────────────────
 function init() {
@@ -599,7 +599,7 @@ function nextSentence() {
   selectSentence(next);
 }
 
-// ── 녹음 ────────────────────────────────────────────
+// ── 녹음 (Azure Speech SDK) ──────────────────────────
 async function toggleRecording() {
   if (isRecording) {
     stopRecording();
@@ -614,16 +614,12 @@ async function startRecording() {
     document.getElementById('configPanel').classList.add('show');
     return;
   }
+  if (!window.SpeechSDK) {
+    showError('Speech SDK 로드 중입니다. 잠시 후 다시 시도해주세요.');
+    return;
+  }
+
   try {
-    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-    audioChunks = [];
-    mediaRecorder = new MediaRecorder(stream, { mimeType: 'audio/webm' });
-    mediaRecorder.ondataavailable = e => audioChunks.push(e.data);
-    mediaRecorder.onstop = () => {
-      stream.getTracks().forEach(t => t.stop());
-      processAudio();
-    };
-    mediaRecorder.start();
     isRecording = true;
     document.getElementById('micBtn').classList.add('recording');
     document.getElementById('micBtn').textContent = '⏹';
@@ -631,120 +627,100 @@ async function startRecording() {
     document.getElementById('micStatus').classList.add('active');
     hideError();
     document.getElementById('resultCard').classList.remove('show');
+
+    const referenceText = SENTENCES[currentIdx].text;
+    document.getElementById('loadingBox').classList.remove('show');
+
+    // SDK로 인식 시작 (버튼 다시 누를 때까지 대기)
+    const result = await startSDKRecognition(referenceText);
+    showResult(result, referenceText);
+
   } catch (e) {
-    showError('마이크 접근 권한이 필요합니다. 브라우저 설정에서 허용해주세요.');
+    if (e.message !== 'CANCELLED') {
+      showError('분석 중 오류가 발생했어요: ' + e.message);
+    }
+  } finally {
+    isRecording = false;
+    document.getElementById('micBtn').classList.remove('recording');
+    document.getElementById('micBtn').textContent = '🎤';
+    document.getElementById('micBtn').disabled = false;
+    document.getElementById('micStatus').textContent = '버튼을 눌러 말하세요';
+    document.getElementById('micStatus').classList.remove('active');
+    document.getElementById('loadingBox').classList.remove('show');
+    currentRecognizer = null;
   }
 }
 
 function stopRecording() {
-  if (mediaRecorder && isRecording) {
-    mediaRecorder.stop();
-    isRecording = false;
-    document.getElementById('micBtn').classList.remove('recording');
-    document.getElementById('micBtn').textContent = '🎤';
-    document.getElementById('micBtn').disabled = true;
-    document.getElementById('micStatus').textContent = '분석 중...';
-    document.getElementById('micStatus').classList.remove('active');
-  }
-}
-
-// ── 오디오 처리 → Azure API ─────────────────────────
-async function processAudio() {
+  document.getElementById('micStatus').textContent = '분석 중...';
   document.getElementById('loadingBox').classList.add('show');
-
-  try {
-    const blob = new Blob(audioChunks, { type: 'audio/webm' });
-    const wavBlob = await convertToWav(blob);
-
-    const referenceText = SENTENCES[currentIdx].text;
-    const result = await callAzurePronunciation(wavBlob, referenceText);
-    showResult(result, referenceText);
-  } catch (e) {
-    showError('분석 중 오류가 발생했어요: ' + e.message);
-  } finally {
-    document.getElementById('loadingBox').classList.remove('show');
-    document.getElementById('micBtn').disabled = false;
-    document.getElementById('micStatus').textContent = '버튼을 눌러 다시 말하세요';
+  if (currentRecognizer) {
+    currentRecognizer.stopContinuousRecognitionAsync();
   }
 }
 
-// WebM → WAV 변환 (Azure는 PCM WAV 선호)
-async function convertToWav(blob) {
-  const arrayBuffer = await blob.arrayBuffer();
-  const audioCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
-  const decoded = await audioCtx.decodeAudioData(arrayBuffer);
+function startSDKRecognition(referenceText) {
+  return new Promise((resolve, reject) => {
+    const SpeechSDK = window.SpeechSDK;
+    const speechConfig = SpeechSDK.SpeechConfig.fromSubscription(AZURE_KEY, AZURE_REGION);
+    speechConfig.speechRecognitionLanguage = 'en-US';
 
-  const numChannels = 1;
-  const sampleRate = 16000;
-  const samples = decoded.getChannelData(0);
-  const resampledLength = Math.floor(samples.length * sampleRate / decoded.sampleRate);
-  const resampled = new Float32Array(resampledLength);
+    const audioConfig = SpeechSDK.AudioConfig.fromDefaultMicrophoneInput();
+    const recognizer = new SpeechSDK.SpeechRecognizer(speechConfig, audioConfig);
+    currentRecognizer = recognizer;
 
-  for (let i = 0; i < resampledLength; i++) {
-    resampled[i] = samples[Math.floor(i * decoded.sampleRate / sampleRate)];
-  }
+    const pronunciationConfig = new SpeechSDK.PronunciationAssessmentConfig(
+      referenceText,
+      SpeechSDK.PronunciationAssessmentGradingSystem.HundredMark,
+      SpeechSDK.PronunciationAssessmentGranularity.Phoneme,
+      true
+    );
+    pronunciationConfig.applyTo(recognizer);
 
-  const pcm = new Int16Array(resampled.length);
-  for (let i = 0; i < resampled.length; i++) {
-    pcm[i] = Math.max(-32768, Math.min(32767, Math.round(resampled[i] * 32767)));
-  }
+    recognizer.recognized = (s, e) => {
+      if (e.result.reason === SpeechSDK.ResultReason.RecognizedSpeech) {
+        const paResult = SpeechSDK.PronunciationAssessmentResult.fromResult(e.result);
+        const words = paResult.detailResult?.Words || [];
+        const fakeNBest = {
+          NBest: [{
+            PronunciationAssessment: {
+              AccuracyScore: paResult.accuracyScore,
+              FluencyScore: paResult.fluencyScore,
+              CompletenessScore: paResult.completenessScore,
+              PronScore: paResult.pronunciationScore,
+            },
+            Words: words.map(w => ({
+              Word: w.Word,
+              PronunciationAssessment: {
+                AccuracyScore: w.PronunciationAssessment?.AccuracyScore ?? 100,
+                ErrorType: w.PronunciationAssessment?.ErrorType ?? 'None',
+              }
+            }))
+          }]
+        };
+        recognizer.stopContinuousRecognitionAsync(() => {
+          recognizer.close();
+          resolve(fakeNBest);
+        });
+      }
+    };
 
-  const wavBuffer = new ArrayBuffer(44 + pcm.byteLength);
-  const view = new DataView(wavBuffer);
-  const writeStr = (o, s) => [...s].forEach((c, i) => view.setUint8(o + i, c.charCodeAt(0)));
+    recognizer.canceled = (s, e) => {
+      recognizer.close();
+      if (e.reason === SpeechSDK.CancellationReason.Error) {
+        reject(new Error('Azure 오류: ' + e.errorDetails));
+      } else {
+        reject(new Error('CANCELLED'));
+      }
+    };
 
-  writeStr(0, 'RIFF');
-  view.setUint32(4, 36 + pcm.byteLength, true);
-  writeStr(8, 'WAVE');
-  writeStr(12, 'fmt ');
-  view.setUint32(16, 16, true);
-  view.setUint16(20, 1, true);
-  view.setUint16(22, numChannels, true);
-  view.setUint32(24, sampleRate, true);
-  view.setUint32(28, sampleRate * numChannels * 2, true);
-  view.setUint16(32, numChannels * 2, true);
-  view.setUint16(34, 16, true);
-  writeStr(36, 'data');
-  view.setUint32(40, pcm.byteLength, true);
-  new Int16Array(wavBuffer, 44).set(pcm);
-
-  audioCtx.close();
-  return new Blob([wavBuffer], { type: 'audio/wav' });
-}
-
-// Azure Pronunciation Assessment 호출
-async function callAzurePronunciation(wavBlob, referenceText) {
-  const pronunciationAssessmentConfig = JSON.stringify({
-    ReferenceText: referenceText,
-    GradingSystem: "HundredMark",
-    Granularity: "Phoneme",
-    EnableMiscue: true,
-    ScenarioId: ""
+    recognizer.startContinuousRecognitionAsync(
+      () => {},
+      err => { recognizer.close(); reject(new Error(err)); }
+    );
   });
-
-  const base64Config = btoa(unescape(encodeURIComponent(pronunciationAssessmentConfig)));
-
-  const url = `https://${AZURE_REGION}.stt.speech.microsoft.com/speech/recognition/conversation/cognitiveservices/v1?language=en-US&format=detailed`;
-
-  const response = await fetch(url, {
-    method: 'POST',
-    headers: {
-      'Ocp-Apim-Subscription-Key': AZURE_KEY,
-      'Content-Type': 'audio/wav; codecs=audio/pcm; samplerate=16000',
-      'Pronunciation-Assessment': base64Config,
-      'Accept': 'application/json'
-    },
-    body: wavBlob
-  });
-
-  if (!response.ok) {
-    const errText = await response.text();
-    throw new Error(`Azure API 오류 (${response.status}): ${errText}`);
-  }
-
-  const data = await response.json();
-  return data;
 }
+
 
 // ── Azure TTS (한국어 음성 피드백) ───────────────────
 async function speakKorean(text) {
